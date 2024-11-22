@@ -25,22 +25,26 @@ type Applier interface {
 	Apply(context.Context, fs.FS, *ocv1.ClusterExtension, map[string]string, map[string]string) ([]client.Object, string, error)
 }
 
+type RuntimeRouter interface {
+	GetRuntimeForBundleSource(bundleSource *runtime.BundleSource) (Runtime, error)
+}
+
 type Runtime struct {
-	runtime.Unpacker
+	runtime.BundleUnpacker
 	Applier
-	InstalledBundleGetter
 }
 
 type Kernel struct {
-	Resolver resolve.Resolver
-	Runtime  *Runtime
+	Resolver              resolve.Resolver
+	RuntimeRouter         RuntimeRouter
+	InstalledBundleGetter InstalledBundleGetter
 }
 
 func (r *Kernel) Sync(ctx context.Context, ext *ocv1.ClusterExtension) error {
 	l := log.FromContext(ctx)
 
 	l.Info("getting installed bundle")
-	installedBundle, err := r.Runtime.GetInstalledBundle(ctx, ext)
+	installedBundle, err := r.InstalledBundleGetter.GetInstalledBundle(ctx, ext)
 	if err != nil {
 		setInstallStatus(ext, nil)
 		setInstalledStatusConditionUnknown(ext, err.Error())
@@ -80,16 +84,20 @@ func (r *Kernel) Sync(ctx context.Context, ext *ocv1.ClusterExtension) error {
 	SetDeprecationStatus(ext, resolvedBundle.Name, resolvedDeprecation)
 
 	resolvedBundleMetadata := bundleutil.MetadataFor(resolvedBundle.Name, *resolvedBundleVersion)
-	bundleSource := &runtime.BundleSource{
-		Name: ext.GetName(),
-		Type: runtime.SourceTypeImage,
-		Image: &runtime.ImageSource{
-			Ref: resolvedBundle.Image,
-		},
+	bundleSource, err := runtime.BundleSourceFromBundle(resolvedBundle)
+	if err != nil {
+		setStatusProgressing(ext, err)
+		return err
+	}
+
+	bundleRuntime, err := r.RuntimeRouter.GetRuntimeForBundleSource(bundleSource)
+	if err != nil {
+		setStatusProgressing(ext, err)
+		return err
 	}
 
 	l.Info("unpacking resolved bundle")
-	unpackResult, err := r.Runtime.Unpack(ctx, bundleSource)
+	unpackResult, err := bundleRuntime.Unpack(ctx, bundleSource)
 	if err != nil {
 		// Wrap the error passed to this with the resolution information until we have successfully
 		// installed since we intend for the progressing condition to replace the resolved condition
@@ -125,7 +133,7 @@ func (r *Kernel) Sync(ctx context.Context, ext *ocv1.ClusterExtension) error {
 	// to ensure exponential backoff can occur:
 	//   - Permission errors (it is not possible to watch changes to permissions.
 	//     The only way to eventually recover from permission errors is to keep retrying).
-	_, _, err = r.Runtime.Apply(ctx, unpackResult.Bundle, ext, objLbls, storeLbls)
+	_, _, err = bundleRuntime.Apply(ctx, unpackResult.Bundle, ext, objLbls, storeLbls)
 	if err != nil {
 		setStatusProgressing(ext, wrapErrorWithResolutionInfo(resolvedBundleMetadata, err))
 		// Now that we're actually trying to install, use the error

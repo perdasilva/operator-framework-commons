@@ -105,7 +105,7 @@ func (r *CatalogCache) Sync(ctx context.Context, catalog *catalogd.ClusterCatalo
 	// TODO: The below algorithm to get the current state based on an in-memory
 	//    storedCatalogs map is a hack that helps us keep the ClusterCatalog's
 	//    status up-to-date. The fact that we need this setup is indicative of
-	//    a larger problem with the design of one or both of the Unpacker and
+	//    a larger problem with the design of one or both of the BundleUnpacker and
 	//    Storage interfaces and/or their interactions. We should fix this.
 	expectedStatus, storedCatalog, err := r.getCurrentState(ctx, catalog)
 

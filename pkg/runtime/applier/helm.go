@@ -1,124 +1,97 @@
 package applier
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"helm.sh/helm/v3/pkg/chart/loader"
 	"io"
 	"io/fs"
+	"path/filepath"
 	"strings"
 
+	helmclient "github.com/operator-framework/helm-operator-plugins/pkg/client"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/postrender"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	apimachyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	helmclient "github.com/operator-framework/helm-operator-plugins/pkg/client"
 
 	ocv1 "github.com/operator-framework/operator-controller/api/v1"
-	"github.com/perdasilva/operator-framework-commons/pkg/runtime/convert"
-	"github.com/perdasilva/operator-framework-commons/pkg/runtime/preflights/crdupgradesafety"
 	"github.com/perdasilva/operator-framework-commons/pkg/runtime/util"
 )
 
-const (
-	StateNeedsInstall     string = "NeedsInstall"
-	StateNeedsUpgrade     string = "NeedsUpgrade"
-	StateUnchanged        string = "Unchanged"
-	StateError            string = "Error"
-	maxHelmReleaseHistory        = 10
-)
-
-// Preflight is a check that should be run before making any changes to the cluster
-type Preflight interface {
-	// Install runs checks that should be successful prior
-	// to installing the Helm release. It is provided
-	// a Helm release and returns an error if the
-	// check is unsuccessful
-	Install(context.Context, *release.Release) error
-
-	// Upgrade runs checks that should be successful prior
-	// to upgrading the Helm release. It is provided
-	// a Helm release and returns an error if the
-	// check is unsuccessful
-	Upgrade(context.Context, *release.Release) error
+type HelmApplier struct {
+	ActionClient helmclient.ActionInterface
 }
 
-type Helm struct {
-	ActionClientGetter helmclient.ActionClientGetter
-	Preflights         []Preflight
-}
+func loadChartFromFS(fsys fs.FS) (*chart.Chart, error) {
+	var files []*loader.BufferedFile
 
-// shouldSkipPreflight is a helper to determine if the preflight check is CRDUpgradeSafety AND
-// if it is set to enforcement None.
-func shouldSkipPreflight(ctx context.Context, preflight Preflight, ext *ocv1.ClusterExtension, state string) bool {
-	l := log.FromContext(ctx)
-	hasCRDUpgradeSafety := ext.Spec.Install != nil && ext.Spec.Install.Preflight != nil && ext.Spec.Install.Preflight.CRDUpgradeSafety != nil
-	_, isCRDUpgradeSafetyInstance := preflight.(*crdupgradesafety.Preflight)
+	// Walk through the file system and gather the chart files
+	err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 
-	if hasCRDUpgradeSafety && isCRDUpgradeSafetyInstance {
-		if state == StateNeedsInstall || state == StateNeedsUpgrade {
-			l.Info("crdUpgradeSafety ", "policy", ext.Spec.Install.Preflight.CRDUpgradeSafety.Enforcement)
+		// Ignore directories
+		if d.IsDir() {
+			return nil
 		}
-		if ext.Spec.Install.Preflight.CRDUpgradeSafety.Enforcement == ocv1.CRDUpgradeSafetyEnforcementNone {
-			// Skip this preflight check because it is of type *crdupgradesafety.Preflight and the CRD Upgrade Safety
-			// policy is set to None
-			return true
+
+		// Open the file from fs.FS
+		file, err := fsys.Open(path)
+		if err != nil {
+			return err
 		}
+		defer file.Close()
+
+		// Read the file content
+		content, err := io.ReadAll(file)
+		if err != nil {
+			return err
+		}
+
+		// Create a BufferedFile with the content
+		files = append(files, &loader.BufferedFile{Name: filepath.Base(path), Data: content})
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error walking file system: %v", err)
 	}
-	return false
+
+	// Load the chart from the in-memory files
+	chart, err := loader.LoadFiles(files)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load chart: %v", err)
+	}
+
+	return chart, nil
 }
 
-func (h *Helm) Apply(ctx context.Context, contentFS fs.FS, ext *ocv1.ClusterExtension, objectLabels map[string]string, storageLabels map[string]string) ([]client.Object, string, error) {
-	chrt, err := convert.RegistryV1ToHelmChart(ctx, contentFS, ext.Spec.Namespace, []string{corev1.NamespaceAll})
+func (h *HelmApplier) Apply(ctx context.Context, contentFS fs.FS, ext *ocv1.ClusterExtension, objectLabels map[string]string, storageLabels map[string]string) ([]client.Object, string, error) {
+	chrt, err := loadChartFromFS(contentFS)
 	if err != nil {
 		return nil, "", err
 	}
 	values := chartutil.Values{}
 
-	ac, err := h.ActionClientGetter.ActionClientFor(ctx, ext)
-	if err != nil {
-		return nil, "", err
-	}
-
 	post := &postrenderer{
 		labels: objectLabels,
 	}
 
-	rel, desiredRel, state, err := h.getReleaseState(ac, ext, chrt, values, post)
+	rel, _, state, err := h.getReleaseState(h.ActionClient, ext, chrt, values, post)
 	if err != nil {
 		return nil, "", err
 	}
 
-	for _, preflight := range h.Preflights {
-		if shouldSkipPreflight(ctx, preflight, ext, state) {
-			continue
-		}
-		switch state {
-		case StateNeedsInstall:
-			err := preflight.Install(ctx, desiredRel)
-			if err != nil {
-				return nil, state, err
-			}
-		case StateNeedsUpgrade:
-			err := preflight.Upgrade(ctx, desiredRel)
-			if err != nil {
-				return nil, state, err
-			}
-		}
-	}
-
 	switch state {
 	case StateNeedsInstall:
-		rel, err = ac.Install(ext.GetName(), ext.Spec.Namespace, chrt, values, func(install *action.Install) error {
+		rel, err = h.ActionClient.Install(ext.GetName(), ext.Spec.Namespace, chrt, values, func(install *action.Install) error {
 			install.CreateNamespace = false
 			install.Labels = storageLabels
 			return nil
@@ -126,13 +99,12 @@ func (h *Helm) Apply(ctx context.Context, contentFS fs.FS, ext *ocv1.ClusterExte
 			install.PostRenderer = post
 			return nil
 		},
-		//helmclient.AppendInstallPostRenderer(post)
 		)
 		if err != nil {
 			return nil, state, err
 		}
 	case StateNeedsUpgrade:
-		rel, err = ac.Upgrade(ext.GetName(), ext.Spec.Namespace, chrt, values, func(upgrade *action.Upgrade) error {
+		rel, err = h.ActionClient.Upgrade(ext.GetName(), ext.Spec.Namespace, chrt, values, func(upgrade *action.Upgrade) error {
 			upgrade.MaxHistory = maxHelmReleaseHistory
 			upgrade.Labels = storageLabels
 			return nil
@@ -144,7 +116,7 @@ func (h *Helm) Apply(ctx context.Context, contentFS fs.FS, ext *ocv1.ClusterExte
 			return nil, state, err
 		}
 	case StateUnchanged:
-		if err := ac.Reconcile(rel); err != nil {
+		if err := h.ActionClient.Reconcile(rel); err != nil {
 			return nil, state, err
 		}
 	default:
@@ -159,7 +131,7 @@ func (h *Helm) Apply(ctx context.Context, contentFS fs.FS, ext *ocv1.ClusterExte
 	return relObjects, state, nil
 }
 
-func (h *Helm) getReleaseState(cl helmclient.ActionInterface, ext *ocv1.ClusterExtension, chrt *chart.Chart, values chartutil.Values, post postrender.PostRenderer) (*release.Release, *release.Release, string, error) {
+func (h *HelmApplier) getReleaseState(cl helmclient.ActionInterface, ext *ocv1.ClusterExtension, chrt *chart.Chart, values chartutil.Values, post postrender.PostRenderer) (*release.Release, *release.Release, string, error) {
 	currentRelease, err := cl.Get(ext.GetName())
 	if err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
 		return nil, nil, StateError, err
@@ -201,34 +173,4 @@ func (h *Helm) getReleaseState(cl helmclient.ActionInterface, ext *ocv1.ClusterE
 		relState = StateNeedsUpgrade
 	}
 	return currentRelease, desiredRelease, relState, nil
-}
-
-type postrenderer struct {
-	labels  map[string]string
-	cascade postrender.PostRenderer
-}
-
-func (p *postrenderer) Run(renderedManifests *bytes.Buffer) (*bytes.Buffer, error) {
-	var buf bytes.Buffer
-	dec := apimachyaml.NewYAMLOrJSONDecoder(renderedManifests, 1024)
-	for {
-		obj := unstructured.Unstructured{}
-		err := dec.Decode(&obj)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		obj.SetLabels(util.MergeMaps(obj.GetLabels(), p.labels))
-		b, err := obj.MarshalJSON()
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(b)
-	}
-	if p.cascade != nil {
-		return p.cascade.Run(&buf)
-	}
-	return &buf, nil
 }

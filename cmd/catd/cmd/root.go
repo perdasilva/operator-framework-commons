@@ -78,6 +78,75 @@ func getKernel(ac *utils.ActionConfig) *ofrt.Kernel {
 	}
 }
 
+func getInstalledBundleGetter(ac action.ActionClientGetter) ofrt.InstalledBundleGetter {
+	return &DefaultInstalledBundleGetter{ActionClientGetter: ac}
+}
+
+func getRegistryV1Runtime(ac *utils.ActionConfig, clust cluster.Cluster) (*ofrt.Runtime, error) {
+	unpackPath := filepath.Join(ac.BaseConfigPath, "bundle-unpack")
+	unpacker := &ofrtsrc.ContainersImageRegistry{
+		BaseCachePath: unpackPath,
+		SourceContextFunc: func(_ logr.Logger) (*types.SystemContext, error) {
+			return &types.SystemContext{}, nil
+		},
+	}
+
+	actionClient, err := getActionClient(ac, clust)
+	if err != nil {
+		panic(err)
+	}
+
+	aeClient, err := apiextensionsv1client.NewForConfig(clust.GetConfig())
+	if err != nil {
+		panic(err)
+	}
+
+	preflights := []applier.Preflight{
+		crdupgradesafety.NewPreflight(aeClient.CustomResourceDefinitions()),
+	}
+
+	applr := &applier.RegistryV1{
+		ActionClientGetter: actionClient,
+		Preflights:         preflights,
+	}
+
+	return &ofrt.Runtime{
+		BundleUnpacker: unpacker,
+		Applier:        applr,
+	}, nil
+}
+
+func getHelmRuntime(ac *utils.ActionConfig, clust cluster.Cluster) (*ofrt.Runtime, error) {
+	unpackPath := filepath.Join(ac.BaseConfigPath, "bundle-unpack")
+	unpacker := &ofrtsrc.TarGZ{
+		BaseCachePath: unpackPath,
+	}
+
+	actionClient, err := getActionClient(ac, clust)
+	if err != nil {
+		panic(err)
+	}
+
+	aeClient, err := apiextensionsv1client.NewForConfig(clust.GetConfig())
+	if err != nil {
+		panic(err)
+	}
+
+	preflights := []applier.Preflight{
+		crdupgradesafety.NewPreflight(aeClient.CustomResourceDefinitions()),
+	}
+
+	applr := &applier.RegistryV1{
+		ActionClientGetter: actionClient,
+		Preflights:         preflights,
+	}
+
+	return &ofrt.Runtime{
+		BundleUnpacker: unpacker,
+		Applier:        applr,
+	}, nil
+}
+
 func getRuntime(ac *utils.ActionConfig) *ofrt.Runtime {
 	clust, err := getCluster()
 	if err != nil {
@@ -105,13 +174,13 @@ func getRuntime(ac *utils.ActionConfig) *ofrt.Runtime {
 		crdupgradesafety.NewPreflight(aeClient.CustomResourceDefinitions()),
 	}
 
-	applier := &applier.Helm{
+	applier := &applier.RegistryV1{
 		ActionClientGetter: actionClient,
 		Preflights:         preflights,
 	}
 
 	return &ofrt.Runtime{
-		Unpacker:              unpacker,
+		BundleUnpacker:        unpacker,
 		Applier:               applier,
 		InstalledBundleGetter: &DefaultInstalledBundleGetter{ActionClientGetter: actionClient},
 	}
